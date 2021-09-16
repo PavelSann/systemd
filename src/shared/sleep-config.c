@@ -311,6 +311,25 @@ static bool location_is_resume_device(const HibernateLocation *location, dev_t s
                 (sys_offset == location->offset || (sys_offset > 0 && location->offset == UINT64_MAX));
 }
 
+static bool get_meminfo_active(unsigned long long *act) {
+        int r;
+        _cleanup_free_ char *active = NULL;
+        /*Active(anon) - The amount of anonymous and tmpfs/shmem memory, in kibibytes, that is in active use,
+         *               or was in active use since the last time the system moved something to swap.
+         */
+        r = get_proc_field("/proc/meminfo", "Active(anon)", WHITESPACE, &active);
+        if (r < 0) {
+                return log_debug_errno(r, "Failed to retrieve Active(anon) from /proc/meminfo: %m");
+        }
+
+        r = safe_atollu(active, act);
+        if (r < 0) {
+                return log_debug_errno(r, "Failed to parse Active(anon) from /proc/meminfo: %s: %m", active);
+        }
+
+        return 0;
+}
+
 /*
  * Attempt to find the hibernation location by parsing /proc/swaps, /sys/power/resume, and
  * /sys/power/resume_offset.
@@ -330,6 +349,7 @@ int find_hibernate_location(HibernateLocation **ret_hibernate_location) {
         dev_t sys_resume = 0; /* Unnecessary initialization to appease gcc */
         uint64_t sys_offset = 0;
         bool resume_match = false;
+        unsigned long long act = 0;
         int r;
 
         /* read the /sys/power/resume & /sys/power/resume_offset values */
@@ -341,6 +361,11 @@ int find_hibernate_location(HibernateLocation **ret_hibernate_location) {
         if (!f) {
                 log_debug_errno(errno, "Failed to open /proc/swaps: %m");
                 return errno == ENOENT ? -EOPNOTSUPP : -errno; /* Convert swap not supported to a recognizable error */
+        }
+
+        r= get_meminfo_active(&act);
+        if (r < 0) {
+                return log_debug_errno(r, "Failed to get amount of the Active(anon) memory.");
         }
 
         (void) fscanf(f, "%*s %*s %*s %*s %*s\n");
@@ -388,6 +413,11 @@ int find_hibernate_location(HibernateLocation **ret_hibernate_location) {
 
                 } else {
                         log_debug("%s: swap type %s is unsupported for hibernation, ignoring", swap->device, swap->type);
+                        continue;
+                }
+
+                if (act > (swap->size - swap->used) * HIBERNATION_SWAP_THRESHOLD) {
+                        log_debug("%s: ignoring device with insufficient free space", swap->device);
                         continue;
                 }
 
@@ -466,7 +496,6 @@ int find_hibernate_location(HibernateLocation **ret_hibernate_location) {
 }
 
 static bool enough_swap_for_hibernation(void) {
-        _cleanup_free_ char *active = NULL;
         _cleanup_(hibernate_location_freep) HibernateLocation *hibernate_location = NULL;
         unsigned long long act = 0;
         int r;
@@ -490,15 +519,9 @@ static bool enough_swap_for_hibernation(void) {
         if (!hibernate_location)
                 return false;
 
-        r = get_proc_field("/proc/meminfo", "Active(anon)", WHITESPACE, &active);
+        r= get_meminfo_active(&act);
         if (r < 0) {
-                log_debug_errno(r, "Failed to retrieve Active(anon) from /proc/meminfo: %m");
-                return false;
-        }
-
-        r = safe_atollu(active, &act);
-        if (r < 0) {
-                log_debug_errno(r, "Failed to parse Active(anon) from /proc/meminfo: %s: %m", active);
+                log_debug_errno(r, "Failed to get amount of the Active(anon) memory.");
                 return false;
         }
 
